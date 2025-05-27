@@ -108,7 +108,7 @@ async def refresh_access_token(request: TokenRefreshRequest, db: Session = Depen
 
     access_token = create_access_token(data={
         "sub": str(user.email),
-        "name": db_user.first_name,
+        "name": user.first_name,
         "is_admin": user.is_admin,
         "user_role": user.user_role
     })

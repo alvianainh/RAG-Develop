@@ -196,7 +196,15 @@ def are_valid_uuids(session_ids):
     except:
         return False
 
-
+def get_chat_history_by_session_id(session_id):
+    resp = supabase.table("chat_history").select("role, message")\
+        .eq("session_id", session_id).order("timestamp").execute()
+    
+    return [
+        {"role": item["role"], "content": item["message"]}
+        for item in resp.data
+        if item.get("message") is not None and isinstance(item["message"], str)
+    ]
 
 class QueryRequest(BaseModel):
     user_query: str
@@ -283,28 +291,59 @@ def chat_with_llm(
     try:
         if request.session_ids is not None and len(request.session_ids) > 0:
             context_session_ids = request.session_ids
-            force_new = request.force_new_virtual_session if request.force_new_virtual_session else False
-            save_session_id = create_virtual_context_session(user_uuid, context_session_ids, force_new)
+
+            if len(context_session_ids) == 1:
+                session_id = context_session_ids[0]
+
+                session_resp = supabase.table("sessions").select("created_by, is_public")\
+                    .eq("id", session_id).execute()
+
+                session_data = session_resp.data[0] if session_resp.data else None
+
+                if session_data and session_data["created_by"] == user_uuid and not session_data.get("is_public", False):
+                    save_session_id = session_id
+                    session_type = "Single-session"
+                else:
+                    force_new = request.force_new_virtual_session if request.force_new_virtual_session else False
+                    save_session_id = create_virtual_context_session(user_uuid, context_session_ids, force_new)
+                    session_type = "Multi-session"
+            else:
+                force_new = request.force_new_virtual_session if request.force_new_virtual_session else False
+                save_session_id = create_virtual_context_session(user_uuid, context_session_ids, force_new)
+                session_type = "Multi-session"
 
         else:
             context_session_ids = get_accessible_session_ids(supabase, user_uuid)
             force_new = request.force_new_global_session if request.force_new_global_session else False
             save_session_id = get_or_create_global_context_session(user_uuid, force_new)
+            session_type = "Global-context"
 
         if not context_session_ids:
             raise ValueError("context_session_ids is empty or None")
+        
+        if request.chat_history:
+            recent_history = request.chat_history
+        else:
+            full_history = get_chat_history_by_session_id(save_session_id)
+            recent_history = full_history[-6:] if len(full_history) >= 6 else full_history
+
+        recent_history.append({"role": "user", "content": request.user_query})
 
         retrieved_chunks = query_supabase(request.user_query, user_uuid, context_session_ids)
 
-        answer, chat_history = call_openai_llm(request.user_query, retrieved_chunks, request.chat_history)
+        answer, _ = call_openai_llm(request.user_query, retrieved_chunks, recent_history)
 
         save_chat_message(user_uuid, save_session_id, "user", request.user_query)
         save_chat_message(user_uuid, save_session_id, "assistant", answer)
 
         return {
             "answer": answer,
-            "chat_history": chat_history
+            "chat_history": recent_history + [{"role": "assistant", "content": answer}],
+            "used_session_id": save_session_id,
+            "context_session_ids": context_session_ids,
+            "session_type": session_type
         }
+
 
     except Exception as e:
         print("Error in /chat:", str(e))

@@ -20,6 +20,8 @@ from collections import defaultdict
 from fastapi import Body
 from sqlalchemy.orm import Session
 from database import get_db
+import requests
+from fastapi.responses import StreamingResponse
 
 
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +72,7 @@ def get_user_uuid_by_email(email: str) -> str:
         return response.data[0]["id"]
     else:
         raise ValueError(f"User with email {email} not found.")
-        
+
 
 def build_folder_tree(files, storage):
     tree = {}
@@ -358,6 +360,155 @@ def get_session_detail(session_id: str, current_user: dict = Depends(get_current
         "chat_history": chats
     }
 
+@router.get("/myfiles")
+def get_user_uploaded_files(current_user: dict = Depends(get_current_user)):
+    user_email = current_user["email"]
+
+
+    user = supabase.table("users").select("id, user_role").eq("email", user_email).single().execute()
+    if not user.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = user.data["id"]
+    role = user.data["user_role"]
+
+    allowed_user_ids = []
+
+    if role == "admin":
+        all_users = supabase.table("users").select("id").execute()
+        allowed_user_ids = [u["id"] for u in all_users.data]
+
+    elif role == "sales":
+        allowed_users = supabase.table("users") \
+            .select("id") \
+            .in_("user_role", ["sales", "admin"]) \
+            .execute()
+        allowed_user_ids = [u["id"] for u in allowed_users.data]
+
+    elif role == "user":
+        allowed_users = supabase.table("users") \
+            .select("id") \
+            .in_("user_role", ["admin"]) \
+            .execute()
+        allowed_user_ids = [u["id"] for u in allowed_users.data]
+        allowed_user_ids.append(user_id)  
+
+    else:
+        raise HTTPException(status_code=403, detail="Unknown role")
+
+    files_res = supabase.table("documents_track") \
+        .select("id, file_name, file_path, user_id, session_id, uploaded_at") \
+        .in_("user_id", allowed_user_ids) \
+        .execute()
+
+    if not files_res.data:
+        return []
+
+    bucket_name = "docs"
+    file_list = []
+
+    for file in files_res.data:
+        file_path = file["file_path"]
+        try:
+            signed_url_res = supabase.storage.from_(bucket_name).create_signed_url(
+                path=file_path, expires_in=3600
+            )
+            file_url = signed_url_res.get("signedURL") or signed_url_res.get("publicURL")
+        except Exception:
+            file_url = None
+
+        file_list.append({
+            "id": file["id"],
+            "file_name": file["file_name"],
+            "session_id": file.get("session_id"),
+            "uploaded_at": file["uploaded_at"],
+            "user_id": file["user_id"], 
+            "file_url": file_url,
+        })
+
+    return file_list
+
+@router.get("/download/{file_id}")
+def download_file(file_id: str, current_user: dict = Depends(get_current_user)):
+    user_email = current_user["email"]
+
+    user = supabase.table("users").select("id, user_role").eq("email", user_email).single().execute()
+    if not user.data:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_id = user.data["id"]
+    role = user.data["user_role"]
+
+    file_res = supabase.table("documents_track") \
+        .select("file_name, file_path, user_id, session_id") \
+        .eq("id", file_id).single().execute()
+
+    if not file_res.data:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_owner_id = file_res.data["user_id"]
+    file_path = file_res.data["file_path"]
+    file_name = file_res.data["file_name"]
+    session_id = file_res.data["session_id"]
+
+    session_res = supabase.table("sessions") \
+        .select("is_public, allowed_roles") \
+        .eq("id", session_id).single().execute()
+
+    if not session_res.data:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    is_public = session_res.data.get("is_public", False)
+    allowed_roles = session_res.data.get("allowed_roles") or []
+
+    is_authorized = False
+
+    if is_public:
+        is_authorized = True
+    elif role in allowed_roles:
+        is_authorized = True
+    elif role == "admin":
+        is_authorized = True
+    elif role == "sales":
+        allowed_users = supabase.table("users") \
+            .select("id") \
+            .in_("user_role", ["sales", "admin"]) \
+            .execute()
+        allowed_user_ids = [u["id"] for u in allowed_users.data]
+        is_authorized = file_owner_id in allowed_user_ids
+    elif role == "user":
+        allowed_users = supabase.table("users") \
+            .select("id") \
+            .in_("user_role", ["admin"]) \
+            .execute()
+        allowed_user_ids = [u["id"] for u in allowed_users.data]
+        allowed_user_ids.append(user_id)
+        is_authorized = file_owner_id in allowed_user_ids
+
+    if not is_authorized:
+        raise HTTPException(status_code=403, detail="You do not have access to this file")
+
+    signed_url_res = supabase.storage.from_("docs").create_signed_url(
+        path=file_path,
+        expires_in=3600
+    )
+    file_url = signed_url_res.get("signedURL")
+
+    if not file_url:
+        raise HTTPException(status_code=500, detail="Failed to get signed URL")
+
+    response = requests.get(file_url, stream=True)
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to fetch file from storage")
+
+    return StreamingResponse(
+        response.raw,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'}
+    )
+
+
+
 @router.post("/create/session")
 def create_session(data: SessionCreate, current_user: str = Depends(get_current_user)):
 
@@ -508,9 +659,13 @@ async def run_pipeline(
                 logger.error(f"JSON file not found: {json_file_path}")
 
         # Image processing
-        result = process_markdown_files(INPUT_DIR_img, OUTPUT_DIR_img, user_id, session_id)
-        if "Error" in result.get("message", ""):
-            raise HTTPException(status_code=500, detail=result["message"])
+        image_processing_results = process_markdown_files(INPUT_DIR_img, OUTPUT_DIR_img, user_id, session_id)
+        if "Error" in image_processing_results.get("message", ""):
+            raise HTTPException(status_code=500, detail=image_processing_results["message"])
+
+        skipped_files = [r for r in image_processing_results.get("results", []) if r["status"] == "skipped"]
+        if skipped_files:
+            logger.warning(f"Image processing skipped for some files: {skipped_files}")
 
         # Chunking
         files = list_markdown_files_from_supabase(user_id, session_id)
@@ -557,6 +712,7 @@ async def run_pipeline(
     return {
         "message": "Pipeline completed successfully.",
         "chunking_results": chunking_results,
-        "embedding_results": embedding_results
+        "embedding_results": embedding_results,
+        "image_processing_results": image_processing_results
     }
     

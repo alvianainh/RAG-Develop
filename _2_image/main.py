@@ -86,19 +86,27 @@ def download_all_files_from_folder(user_id: str, supabase: Client, session_id: s
             logger.info(f"Processing item: {name}")
 
             if "." not in name:
+                subfolder_path = f"{base_supabase_path}/{name}"
+                try:
+                    subitems = supabase.storage.from_(SUPABASE_BUCKET).list(subfolder_path)
+                except Exception as e:
+                    logger.warning(f"Could not list subfolder {subfolder_path}: {e}")
+                    continue
 
-                subitems = supabase.storage.from_(SUPABASE_BUCKET).list(f"{base_supabase_path}/{name}")
+                if not subitems:
+                    logger.warning(f"Subfolder {subfolder_path} is empty or does not exist. Skipping.")
+                    continue
+
                 logger.info(f"Found subitems in folder {name}: {subitems}")
-                
+
                 for subitem in subitems:
                     sub_name = subitem["name"]
-                    sub_supabase_path = f"{base_supabase_path}/{name}/{sub_name}"
+                    sub_supabase_path = f"{subfolder_path}/{sub_name}"
                     local_file_path = INPUT_DIR / name / sub_name
                     result = download_file_from_supabase(sub_supabase_path, local_file_path, supabase, session_id)
                     if result:
                         downloaded_files.append(str(result))
             else:
-
                 local_file_path = INPUT_DIR / name
                 result = download_file_from_supabase(full_supabase_path, local_file_path, supabase, session_id)
                 if result:
@@ -109,7 +117,6 @@ def download_all_files_from_folder(user_id: str, supabase: Client, session_id: s
     except Exception as e:
         logger.error(f"Error downloading files: {e}")
         return {"error": str(e)}
-
 
 def upload_file_to_supabase(file_name: str, local_path: Path, current_user: str, session_id: str) -> bool:
     """Upload updated file back to Supabase Storage."""
@@ -222,6 +229,7 @@ def process_markdown_files(input_folder, output_folder, current_user, session_id
         return {"message": "Error downloading files from Supabase."}
     
     downloaded_files = download_result["files"]
+    results = []
 
     for file_path in downloaded_files:
         if file_path.endswith(".md"):
@@ -231,30 +239,36 @@ def process_markdown_files(input_folder, output_folder, current_user, session_id
             filename_without_ext = os.path.splitext(filename)[0]
             image_folder = os.path.join(input_folder, f"{filename_without_ext}_artifacts")
 
-            if not os.path.exists(image_folder):
-                print(f"Warning: Image folder '{image_folder}' not found for '{filename}'")
-                continue
-
-
-            image_data, lines = extract_images_and_context(markdown_path)
             enriched_data = []
-            for img_path, context_before, context_after in image_data:
-                full_image_path = os.path.join(image_folder, os.path.basename(img_path))
-                caption = generate_caption(model, tokenizer, full_image_path, context_before, context_after)
-                enriched_data.append((img_path, context_before, context_after, caption))
+            lines = []
+
+            if os.path.exists(image_folder):
+                image_data, lines = extract_images_and_context(markdown_path)
+                for img_path, context_before, context_after in image_data:
+                    full_image_path = os.path.join(image_folder, os.path.basename(img_path))
+                    caption = generate_caption(model, tokenizer, full_image_path, context_before, context_after)
+                    enriched_data.append((img_path, context_before, context_after, caption))
+            else:
+                with open(markdown_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                print(f"Info: Image folder '{image_folder}' not found for '{filename}', processing markdown without image enrichment.")
 
             output_path = os.path.join(output_folder, filename)
             update_markdown(markdown_path, enriched_data, lines, output_folder)
             upload_file_to_supabase(filename, output_path, current_user, session_id)
             print(f"Processed and uploaded: {filename}")
-            
+            results.append({"file": filename, "status": "processed"})
+
     try:
         shutil.rmtree(TEMP_DIR) 
         print(f"Folder {TEMP_DIR} has been removed successfully.")
     except Exception as e:
         print(f"Error removing folder {TEMP_DIR}: {e}")
     
-    return {"message": "Success"}
+    return {
+        "message": "Image processing completed.",
+        "results": results
+    }
     
     # temp_folder = TEMP_DIR
     # try:

@@ -3,22 +3,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.wsgi import WSGIMiddleware
 import importlib.util
 import requests
 import shutil
 import os
+import mlflow
+import httpx
+from pathlib import Path
 from fastapi.openapi.utils import get_openapi
 # from fastapi.security import OAuth2PasswordBearer
+from monitoring.setup import configure_monitoring, get_lifespan
+
+configure_monitoring()
 
 
-def import_router(path):
+def import_router(path): 
     spec = importlib.util.spec_from_file_location("api", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.router
-    
+
+
 parsing_router = import_router(os.path.abspath("_1_parsing/api.py"))
 image_router = import_router(os.path.abspath("_2_image/api.py"))
 chunking_router = import_router(os.path.abspath("_3_chunking/api.py"))
@@ -30,7 +39,8 @@ auth_router = import_router(os.path.abspath("auth/api.py"))
 
 # oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-app = FastAPI(title="Pipeline API")
+app = FastAPI(title="Pipeline API", lifespan=get_lifespan())
+# app.add_middleware(AdminOnlyMiddleware, protected_prefix="/mlflow")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,8 +88,6 @@ app.include_router(pipeline_router, prefix="/pipeline", tags=["pipeline"])
 # app.include_router(chunking_router, prefix="/markdown")
 # app.include_router(embedding_router, prefix="/store")
 app.include_router(llm_router, prefix="/llm")
-
-
 
 @app.get("/")
 def read_root():

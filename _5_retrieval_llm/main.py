@@ -16,10 +16,17 @@ from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import nltk
 import psycopg2
+import mlflow
+import time
 from pgvector.psycopg2 import register_vector
 from pathlib import Path
 from typing import List, Optional
 
+from monitoring.decorator import monitor_rag_component
+from monitoring.metrics import (
+    measure_retrieval_metrics,
+    measure_generation_metrics
+)
 
 
 nltk.download('all')
@@ -94,6 +101,8 @@ def get_accessible_session_ids(supabase: Client, user_id: str):
 
     return accessible_ids
 
+
+@monitor_rag_component(component_name="Retriever")
 def query_supabase(user_query, user_id, session_ids=None):
     query_embedding = get_embedding(user_query)
     embedding_str = ','.join([str(x) for x in query_embedding])
@@ -161,13 +170,23 @@ def query_supabase(user_query, user_id, session_ids=None):
     combined_results = text_results + table_results
     combined_results.sort(key=lambda x: x[3], reverse=True)
 
-    return combined_results[:5]
+    top5 = combined_results[:5]
 
+    # Perfomance metrics
+    if not top5:
+        print("[DEBUG] No results found for the query.")
+        measure_retrieval_metrics(top_item=[], embeddings=[])
+        return []
+    
+    measure_retrieval_metrics(top_chunk=top5, get_embedding=get_embedding)
+
+    return top5
+
+
+@monitor_rag_component(component_name="LLM Generator")
 def call_openai_llm(user_query, retrieved_chunks, chat_history=[]):
     """Send the query along with retrieved context and chat history to OpenAI API."""
     context_text = "\n\n".join([f"Chunk {i+1}: {chunk[2]}" for i, chunk in enumerate(retrieved_chunks)])
-    print("\n[DEBUG] Context sent to LLM:")
-    print(context_text[:500]) 
     messages = [
         {"role": "system", "content": "You are an intelligent assistant. Use the following retrieved information to answer the user's query."},
     ]
@@ -182,7 +201,21 @@ def call_openai_llm(user_query, retrieved_chunks, chat_history=[]):
     answer = response.choices[0].message.content  
     chat_history.append({"role": "user", "content": user_query})
     chat_history.append({"role": "assistant", "content": answer})
+
+    # Performance metrics
+    if not retrieved_chunks:
+        print("[DEBUG] No context retrieved for the query.")
+        return answer, chat_history
+
+    measure_generation_metrics(
+        user_query, 
+        retrieved_chunks, 
+        answer, 
+        get_embedding
+    )
+
     return answer, chat_history
+
 
 def chat():
     """Handles continuous chat interaction with support for new chat and conversational context."""
